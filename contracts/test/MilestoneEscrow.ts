@@ -395,4 +395,256 @@ describe("MilestoneEscrow", function () {
       ),
     ).to.be.revertedWithCustomError(escrow, "ZeroMaxRejections");
   });
+
+  async function fundedAgreementFixture() {
+    const ctx = await deployEscrowFixture();
+    await ctx.escrow.createAgreement(
+      ctx.employee.address,
+      ctx.arbiter.address,
+      ctx.reviewWindow,
+      ctx.maxRejections,
+      ctx.descriptions,
+      ctx.amounts,
+      ctx.deadlines,
+      { value: ctx.total },
+    );
+    const proofHash = ethers.id("ipfs://design-mockups");
+    return { ...ctx, proofHash };
+  }
+
+  const Funded = 0;
+  const Submitted = 1;
+  const Approved = 4;
+
+  async function unpaidMilestoneSum(
+    escrow: Awaited<ReturnType<typeof ethers.deployContract>>,
+    agreementId: bigint,
+  ) {
+    const count = await escrow.milestoneCount(agreementId);
+    let sum = 0n;
+    for (let i = 0n; i < count; i++) {
+      const milestone = await escrow.getMilestone(agreementId, i);
+      if (Number(milestone.status) !== Approved) {
+        sum += milestone.amount;
+      }
+    }
+    return sum;
+  }
+
+  describe("submitWork and approve", function () {
+    it("lets the employee submit and the employer pay exactly that milestone", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        amounts,
+        total,
+        proofHash,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      const submitTx = await escrow
+        .connect(employee)
+        .submitWork(0n, 0n, proofHash);
+      const submitReceipt = await submitTx.wait();
+      const submitBlock = await ethers.provider.getBlock(
+        submitReceipt!.blockNumber,
+      );
+
+      await expect(submitTx)
+        .to.emit(escrow, "WorkSubmitted")
+        .withArgs(0n, 0n, proofHash, submitBlock!.timestamp);
+
+      const submitted = await escrow.getMilestone(0n, 0n);
+      expect(submitted.status).to.equal(Submitted);
+      expect(submitted.proofHash).to.equal(proofHash);
+      expect(submitted.submittedAt).to.equal(submitBlock!.timestamp);
+
+      const employeeBefore = await ethers.provider.getBalance(employee.address);
+      const escrowBefore = await ethers.provider.getBalance(
+        await escrow.getAddress(),
+      );
+
+      await expect(escrow.connect(employer).approve(0n, 0n))
+        .to.emit(escrow, "Approved")
+        .withArgs(0n, 0n, employee.address, amounts[0]);
+
+      expect(await ethers.provider.getBalance(employee.address)).to.equal(
+        employeeBefore + amounts[0],
+      );
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        escrowBefore - amounts[0],
+      );
+
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Approved);
+      const remaining = await ethers.provider.getBalance(await escrow.getAddress());
+      expect(remaining).to.equal(total - amounts[0]);
+      expect(remaining).to.equal(await unpaidMilestoneSum(escrow, 0n));
+    });
+
+    it("allows only the employee to submit and only the employer to approve", async function () {
+      const { escrow, employer, employee, arbiter, other, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await expect(
+        escrow.connect(employer).submitWork(0n, 0n, proofHash),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployee");
+      await expect(
+        escrow.connect(arbiter).submitWork(0n, 0n, proofHash),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployee");
+      await expect(
+        escrow.connect(other).submitWork(0n, 0n, proofHash),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployee");
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+
+      await expect(
+        escrow.connect(employee).approve(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+      await expect(
+        escrow.connect(arbiter).approve(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+      await expect(
+        escrow.connect(other).approve(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+    });
+
+    it("reverts submitting twice, approving before submit, and approving twice", async function () {
+      const { escrow, employer, employee, amounts, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await expect(escrow.connect(employer).approve(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Funded, Submitted);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+
+      await expect(
+        escrow.connect(employee).submitWork(0n, 0n, proofHash),
+      )
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Submitted, Funded);
+
+      await escrow.connect(employer).approve(0n, 0n);
+      const afterFirstPay = await ethers.provider.getBalance(
+        await escrow.getAddress(),
+      );
+
+      await expect(escrow.connect(employer).approve(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Approved, Submitted);
+
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        afterFirstPay,
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(amounts[1]);
+    });
+
+    it("reverts submitting after the work deadline", async function () {
+      const { escrow, employee, deadlines, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await networkHelpers.time.increaseTo(deadlines[0] + 1n);
+
+      await expect(escrow.connect(employee).submitWork(0n, 0n, proofHash))
+        .to.be.revertedWithCustomError(escrow, "DeadlinePassed")
+        .withArgs(deadlines[0]);
+    });
+
+    it("reverts on a zero proof hash or a missing agreement or milestone", async function () {
+      const { escrow, employee, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await expect(
+        escrow.connect(employee).submitWork(0n, 0n, ethers.ZeroHash),
+      ).to.be.revertedWithCustomError(escrow, "EmptyProof");
+
+      await expect(escrow.connect(employee).submitWork(99n, 0n, proofHash))
+        .to.be.revertedWithCustomError(escrow, "InvalidAgreement")
+        .withArgs(99n);
+
+      await expect(escrow.connect(employee).submitWork(0n, 9n, proofHash))
+        .to.be.revertedWithCustomError(escrow, "InvalidMilestone")
+        .withArgs(0n, 9n);
+
+      await expect(escrow.approve(99n, 0n))
+        .to.be.revertedWithCustomError(escrow, "InvalidAgreement")
+        .withArgs(99n);
+
+      await expect(escrow.approve(0n, 9n))
+        .to.be.revertedWithCustomError(escrow, "InvalidMilestone")
+        .withArgs(0n, 9n);
+    });
+
+    it("keeps the contract balance equal to unpaid milestone amounts", async function () {
+      const { escrow, employer, employee, amounts, total, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        total,
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        total,
+      );
+
+      await escrow.connect(employer).approve(0n, 0n);
+      const afterFirst = total - amounts[0];
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        afterFirst,
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(afterFirst);
+
+      const secondProof = ethers.id("ipfs://frontend");
+      await escrow.connect(employee).submitWork(0n, 1n, secondProof);
+      await escrow.connect(employer).approve(0n, 1n);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        0n,
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(0n);
+    });
+
+    it("blocks a malicious employee contract from re-entering approve", async function () {
+      const { escrow, employer, arbiter, descriptions, amounts, deadlines, reviewWindow, maxRejections, total } =
+        await networkHelpers.loadFixture(deployEscrowFixture);
+
+      const attacker = await ethers.deployContract("MaliciousEmployee", [
+        await escrow.getAddress(),
+      ]);
+
+      await escrow.createAgreement(
+        await attacker.getAddress(),
+        arbiter.address,
+        reviewWindow,
+        maxRejections,
+        descriptions,
+        amounts,
+        deadlines,
+        { value: total },
+      );
+      await attacker.setTarget(0n, 0n);
+      await attacker.submit(ethers.id("ipfs://attack"));
+
+      const attackerBalanceBefore = await ethers.provider.getBalance(
+        await attacker.getAddress(),
+      );
+
+      await escrow.connect(employer).approve(0n, 0n);
+
+      expect(await attacker.reenterFailed()).to.equal(true);
+      expect(await ethers.provider.getBalance(await attacker.getAddress())).to.equal(
+        attackerBalanceBefore + amounts[0],
+      );
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Approved);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        total - amounts[0],
+      );
+
+      await expect(escrow.connect(employer).approve(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Approved, Submitted);
+    });
+  });
 });
+

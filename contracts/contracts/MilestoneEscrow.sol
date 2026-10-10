@@ -2,11 +2,11 @@
 pragma solidity ^0.8.34;
 
 /// @title MilestoneEscrow
-/// @notice Holds MON for freelance jobs split into milestones. Chunk 1 only
-///         creates an agreement and locks the employer's deposit. Later
-///         chunks will add submit / approve / reject / dispute.
+/// @notice Holds MON for freelance jobs split into milestones. The employer
+///         funds on create; the employee submits proof; the employer can
+///         approve and pay that milestone. Reject / timeout / dispute come later.
 contract MilestoneEscrow {
-    // How far a milestone has gone. Only Funded is used in this chunk.
+    // How far a milestone has gone. This chunk uses Funded, Submitted, Approved.
     enum MilestoneStatus {
         Funded,
         Submitted,
@@ -45,6 +45,8 @@ contract MilestoneEscrow {
     uint256 public constant MAX_MILESTONES = 10;
 
     uint256 public agreementCount;
+    // Simple lock so approve cannot be called again in the same transaction.
+    bool private _locked;
 
     mapping(uint256 => Agreement) private _agreements;
     mapping(uint256 => Milestone[]) private _milestones;
@@ -56,6 +58,18 @@ contract MilestoneEscrow {
         address arbiter,
         uint256 totalDeposited,
         uint256 milestoneCount
+    );
+    event WorkSubmitted(
+        uint256 indexed agreementId,
+        uint256 indexed milestoneId,
+        bytes32 proofHash,
+        uint256 submittedAt
+    );
+    event Approved(
+        uint256 indexed agreementId,
+        uint256 indexed milestoneId,
+        address indexed employee,
+        uint256 amount
     );
 
     error IncorrectDeposit(uint256 sent, uint256 required);
@@ -70,6 +84,14 @@ contract MilestoneEscrow {
     error ZeroMaxRejections();
     error InvalidAgreement(uint256 id);
     error InvalidMilestone(uint256 id, uint256 index);
+    error NotEmployee();
+    error NotEmployer();
+    error AgreementCancelled(uint256 id);
+    error WrongStatus(MilestoneStatus current, MilestoneStatus required);
+    error DeadlinePassed(uint256 deadline);
+    error EmptyProof();
+    error TransferFailed();
+    error Reentrant();
 
     /// @notice Employer starts a job and sends the full milestone budget in MON.
     /// @dev msg.sender becomes the employer. ETH (MON on Monad) stays in this contract.
@@ -118,6 +140,100 @@ contract MilestoneEscrow {
             total,
             descriptions.length
         );
+    }
+
+    /// @notice Freelancer records a proof hash before the work deadline.
+    function submitWork(
+        uint256 agreementId,
+        uint256 milestoneId,
+        bytes32 proofHash
+    ) external {
+        Agreement storage agreement = _requireAgreement(agreementId);
+        if (agreement.cancelled) {
+            revert AgreementCancelled(agreementId);
+        }
+        if (msg.sender != agreement.employee) {
+            revert NotEmployee();
+        }
+        if (proofHash == bytes32(0)) {
+            revert EmptyProof();
+        }
+
+        Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
+        if (milestone.status != MilestoneStatus.Funded) {
+            revert WrongStatus(milestone.status, MilestoneStatus.Funded);
+        }
+        if (block.timestamp > milestone.workDeadline) {
+            revert DeadlinePassed(milestone.workDeadline);
+        }
+
+        milestone.proofHash = proofHash;
+        milestone.submittedAt = block.timestamp;
+        milestone.status = MilestoneStatus.Submitted;
+
+        emit WorkSubmitted(agreementId, milestoneId, proofHash, block.timestamp);
+    }
+
+    /// @notice Employer accepts submitted work and pays that milestone in MON.
+    function approve(
+        uint256 agreementId,
+        uint256 milestoneId
+    ) external nonReentrant {
+        Agreement storage agreement = _requireAgreement(agreementId);
+        if (agreement.cancelled) {
+            revert AgreementCancelled(agreementId);
+        }
+        if (msg.sender != agreement.employer) {
+            revert NotEmployer();
+        }
+
+        Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
+        if (milestone.status != MilestoneStatus.Submitted) {
+            revert WrongStatus(milestone.status, MilestoneStatus.Submitted);
+        }
+
+        uint256 amount = milestone.amount;
+        address employee = agreement.employee;
+        // Mark paid before sending so a re-entry cannot pay twice.
+        milestone.status = MilestoneStatus.Approved;
+
+        emit Approved(agreementId, milestoneId, employee, amount);
+
+        (bool ok, ) = employee.call{value: amount}("");
+        if (!ok) {
+            revert TransferFailed();
+        }
+    }
+
+    modifier nonReentrant() {
+        if (_locked) {
+            revert Reentrant();
+        }
+        _locked = true;
+        _;
+        _locked = false;
+    }
+
+    function _requireAgreement(
+        uint256 id
+    ) private view returns (Agreement storage agreement) {
+        if (id >= agreementCount) {
+            revert InvalidAgreement(id);
+        }
+        agreement = _agreements[id];
+    }
+
+    function _requireMilestone(
+        uint256 id,
+        uint256 index
+    ) private view returns (Milestone storage milestone) {
+        if (id >= agreementCount) {
+            revert InvalidAgreement(id);
+        }
+        if (index >= _milestones[id].length) {
+            revert InvalidMilestone(id, index);
+        }
+        milestone = _milestones[id][index];
     }
 
     function _assertParties(address employee, address arbiter) private view {
@@ -182,10 +298,7 @@ contract MilestoneEscrow {
     }
 
     function getAgreement(uint256 id) external view returns (Agreement memory) {
-        if (id >= agreementCount) {
-            revert InvalidAgreement(id);
-        }
-        return _agreements[id];
+        return _requireAgreement(id);
     }
 
     function milestoneCount(uint256 id) external view returns (uint256) {
@@ -199,12 +312,6 @@ contract MilestoneEscrow {
         uint256 id,
         uint256 index
     ) external view returns (Milestone memory) {
-        if (id >= agreementCount) {
-            revert InvalidAgreement(id);
-        }
-        if (index >= _milestones[id].length) {
-            revert InvalidMilestone(id, index);
-        }
-        return _milestones[id][index];
+        return _requireMilestone(id, index);
     }
 }
