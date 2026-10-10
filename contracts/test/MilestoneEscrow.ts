@@ -418,6 +418,8 @@ describe("MilestoneEscrow", function () {
   const Disputed = 3;
   const Approved = 4;
   const AutoReleased = 5;
+  const Resolved = 6;
+  const ARBITER_TIMEOUT = 3 * 24 * 60 * 60;
 
   async function unpaidMilestoneSum(
     escrow: Awaited<ReturnType<typeof ethers.deployContract>>,
@@ -428,11 +430,31 @@ describe("MilestoneEscrow", function () {
     for (let i = 0n; i < count; i++) {
       const milestone = await escrow.getMilestone(agreementId, i);
       const status = Number(milestone.status);
-      if (status !== Approved && status !== AutoReleased) {
+      if (
+        status !== Approved &&
+        status !== AutoReleased &&
+        status !== Resolved
+      ) {
         sum += milestone.amount;
       }
     }
     return sum;
+  }
+
+  async function rejectUntilDisputed(
+    escrow: Awaited<ReturnType<typeof ethers.deployContract>>,
+    employee: Awaited<ReturnType<typeof ethers.getSigners>>[0],
+    proofHash: string,
+    maxRejections: number,
+  ) {
+    await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+    for (let i = 1; i < maxRejections; i++) {
+      await escrow.reject(0n, 0n, ethers.id(`reject-${i}`));
+      await escrow
+        .connect(employee)
+        .submitWork(0n, 0n, ethers.id(`ipfs://v${i + 1}`));
+    }
+    await escrow.reject(0n, 0n, ethers.id(`reject-${maxRejections}`));
   }
 
   describe("submitWork and approve", function () {
@@ -788,6 +810,10 @@ describe("MilestoneEscrow", function () {
       const disputed = await escrow.getMilestone(0n, 0n);
       expect(disputed.status).to.equal(Disputed);
       expect(disputed.rejectionCount).to.equal(2);
+      const disputeBlock = await ethers.provider.getBlock("latest");
+      expect(await escrow.disputedAt(0n, 0n)).to.equal(
+        BigInt(disputeBlock!.timestamp),
+      );
 
       await expect(
         escrow
@@ -846,6 +872,391 @@ describe("MilestoneEscrow", function () {
       await expect(escrow.connect(employer).approve(0n, 0n))
         .to.be.revertedWithCustomError(escrow, "WrongStatus")
         .withArgs(AutoReleased, Submitted);
+    });
+  });
+
+  describe("raiseDispute, resolve, and splitAfterArbiterTimeout", function () {
+    it("rejects until the cap, then the arbiter resolves with a split", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        arbiter,
+        amounts,
+        total,
+        proofHash,
+        maxRejections,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await rejectUntilDisputed(escrow, employee, proofHash, maxRejections);
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Disputed);
+
+      const employeeShare = amounts[0] / 3n;
+      const employerShare = amounts[0] - employeeShare;
+
+      const employeeBefore = await ethers.provider.getBalance(employee.address);
+      const employerBefore = await ethers.provider.getBalance(employer.address);
+      const escrowBefore = await ethers.provider.getBalance(
+        await escrow.getAddress(),
+      );
+
+      await expect(
+        escrow.connect(arbiter).resolve(0n, 0n, employeeShare),
+      )
+        .to.emit(escrow, "Resolved")
+        .withArgs(0n, 0n, employeeShare, employerShare);
+
+      expect(await ethers.provider.getBalance(employee.address)).to.equal(
+        employeeBefore + employeeShare,
+      );
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerBefore + employerShare,
+      );
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        escrowBefore - amounts[0],
+      );
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Resolved);
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total - amounts[0]);
+    });
+
+    it("lets the arbiter give 100% to the employee or 100% to the employer", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        arbiter,
+        amounts,
+        total,
+        proofHash,
+        maxRejections,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await rejectUntilDisputed(escrow, employee, proofHash, maxRejections);
+
+      const employeeBefore = await ethers.provider.getBalance(employee.address);
+      const employerBefore = await ethers.provider.getBalance(employer.address);
+
+      await expect(escrow.connect(arbiter).resolve(0n, 0n, amounts[0]))
+        .to.emit(escrow, "Resolved")
+        .withArgs(0n, 0n, amounts[0], 0n);
+
+      expect(await ethers.provider.getBalance(employee.address)).to.equal(
+        employeeBefore + amounts[0],
+      );
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerBefore,
+      );
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Resolved);
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total - amounts[0]);
+
+      // Second milestone: reject to dispute, then 100% to employer.
+      await escrow
+        .connect(employee)
+        .submitWork(0n, 1n, ethers.id("ipfs://frontend"));
+      await escrow.reject(0n, 1n, ethers.id("m1-reject-1"));
+      await escrow
+        .connect(employee)
+        .submitWork(0n, 1n, ethers.id("ipfs://frontend-v2"));
+      await escrow.reject(0n, 1n, ethers.id("m1-reject-2"));
+      expect((await escrow.getMilestone(0n, 1n)).status).to.equal(Disputed);
+
+      const employeeMid = await ethers.provider.getBalance(employee.address);
+      const employerMid = await ethers.provider.getBalance(employer.address);
+
+      await expect(escrow.connect(arbiter).resolve(0n, 1n, 0n))
+        .to.emit(escrow, "Resolved")
+        .withArgs(0n, 1n, 0n, amounts[1]);
+
+      expect(await ethers.provider.getBalance(employee.address)).to.equal(
+        employeeMid,
+      );
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerMid + amounts[1],
+      );
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        0n,
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(0n);
+    });
+
+    it("lets the employee raise a dispute after one rejection, and blocks bad raises", async function () {
+      const { escrow, employer, employee, arbiter, other, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await expect(escrow.connect(employee).raiseDispute(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Funded, Rejected);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+
+      await expect(escrow.connect(employee).raiseDispute(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Submitted, Rejected);
+
+      await escrow.reject(0n, 0n, ethers.id("needs-revision"));
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Rejected);
+
+      await expect(
+        escrow.connect(employer).raiseDispute(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployee");
+      await expect(
+        escrow.connect(arbiter).raiseDispute(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployee");
+      await expect(
+        escrow.connect(other).raiseDispute(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployee");
+
+      await expect(escrow.connect(employee).raiseDispute(0n, 0n))
+        .to.emit(escrow, "DisputeRaised")
+        .withArgs(0n, 0n, employee.address);
+
+      const afterRaise = await escrow.getMilestone(0n, 0n);
+      expect(afterRaise.status).to.equal(Disputed);
+      const raiseBlock = await ethers.provider.getBlock("latest");
+      expect(await escrow.disputedAt(0n, 0n)).to.equal(
+        BigInt(raiseBlock!.timestamp),
+      );
+    });
+
+    it("reverts raiseDispute after the resubmit window", async function () {
+      const { escrow, employee, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+      await escrow.reject(0n, 0n, ethers.id("needs-revision"));
+
+      const rejected = await escrow.getMilestone(0n, 0n);
+      await networkHelpers.time.increaseTo(rejected.workDeadline + 1n);
+
+      await expect(escrow.connect(employee).raiseDispute(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "DeadlinePassed")
+        .withArgs(rejected.workDeadline);
+    });
+
+    it("allows only the arbiter to resolve and blocks bad amounts or double resolve", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        arbiter,
+        other,
+        amounts,
+        proofHash,
+        maxRejections,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await expect(escrow.connect(arbiter).resolve(0n, 0n, amounts[0] / 2n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Funded, Disputed);
+
+      await rejectUntilDisputed(escrow, employee, proofHash, maxRejections);
+
+      await expect(
+        escrow.connect(employer).resolve(0n, 0n, amounts[0] / 2n),
+      ).to.be.revertedWithCustomError(escrow, "NotArbiter");
+      await expect(
+        escrow.connect(employee).resolve(0n, 0n, amounts[0] / 2n),
+      ).to.be.revertedWithCustomError(escrow, "NotArbiter");
+      await expect(
+        escrow.connect(other).resolve(0n, 0n, amounts[0] / 2n),
+      ).to.be.revertedWithCustomError(escrow, "NotArbiter");
+
+      const tooHigh = amounts[0] + 1n;
+      await expect(escrow.connect(arbiter).resolve(0n, 0n, tooHigh))
+        .to.be.revertedWithCustomError(escrow, "AmountTooHigh")
+        .withArgs(tooHigh, amounts[0]);
+
+      await escrow.connect(arbiter).resolve(0n, 0n, amounts[0] / 2n);
+
+      await expect(
+        escrow.connect(arbiter).resolve(0n, 0n, amounts[0] / 2n),
+      )
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Resolved, Disputed);
+    });
+
+    it("early splitAfterArbiterTimeout reverts after reject reaches the cap", async function () {
+      const { escrow, employee, proofHash, maxRejections } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await rejectUntilDisputed(escrow, employee, proofHash, maxRejections);
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Disputed);
+
+      const disputedAt = await escrow.disputedAt(0n, 0n);
+      expect(disputedAt).to.be.gt(0n);
+      const availableAt = disputedAt + BigInt(ARBITER_TIMEOUT);
+
+      await expect(
+        escrow.connect(employee).splitAfterArbiterTimeout(0n, 0n),
+      )
+        .to.be.revertedWithCustomError(escrow, "TimeoutNotReached")
+        .withArgs(availableAt);
+    });
+
+    it("early splitAfterArbiterTimeout reverts after raiseDispute", async function () {
+      const { escrow, employee, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+      await escrow.reject(0n, 0n, ethers.id("needs-revision"));
+      await escrow.connect(employee).raiseDispute(0n, 0n);
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Disputed);
+
+      const disputedAt = await escrow.disputedAt(0n, 0n);
+      expect(disputedAt).to.be.gt(0n);
+      const availableAt = disputedAt + BigInt(ARBITER_TIMEOUT);
+
+      await expect(
+        escrow.connect(employee).splitAfterArbiterTimeout(0n, 0n),
+      )
+        .to.be.revertedWithCustomError(escrow, "TimeoutNotReached")
+        .withArgs(availableAt);
+    });
+
+    it("splitAfterArbiterTimeout works after 3 days, blocks strangers, and handles odd amounts", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        other,
+        amounts,
+        total,
+        proofHash,
+        maxRejections,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      // Odd wei amount so amount/2 leaves a 1-wei remainder for the employer.
+      const oddDescriptions = ["Odd payout task"];
+      const oddAmounts = [ethers.parseEther("1") + 1n];
+      const now = await networkHelpers.time.latest();
+      const oddDeadlines = [BigInt(now + 7 * 24 * 60 * 60)];
+      const [, , arbiter] = await ethers.getSigners();
+
+      await escrow.createAgreement(
+        employee.address,
+        arbiter.address,
+        BigInt(3 * 24 * 60 * 60),
+        maxRejections,
+        oddDescriptions,
+        oddAmounts,
+        oddDeadlines,
+        { value: oddAmounts[0] },
+      );
+
+      const agreementId = 1n;
+      await escrow
+        .connect(employee)
+        .submitWork(agreementId, 0n, ethers.id("ipfs://odd"));
+      await escrow.reject(agreementId, 0n, ethers.id("odd-r1"));
+      await escrow
+        .connect(employee)
+        .submitWork(agreementId, 0n, ethers.id("ipfs://odd-v2"));
+      await escrow.reject(agreementId, 0n, ethers.id("odd-r2"));
+
+      const disputedAt = await escrow.disputedAt(agreementId, 0n);
+      const availableAt = disputedAt + BigInt(ARBITER_TIMEOUT);
+
+      // increaseTo mines a block at that timestamp, so the next tx is later.
+      // Call before any travel to prove the timeout still holds.
+      await expect(
+        escrow.connect(employee).splitAfterArbiterTimeout(agreementId, 0n),
+      )
+        .to.be.revertedWithCustomError(escrow, "TimeoutNotReached")
+        .withArgs(availableAt);
+
+      await networkHelpers.time.increaseTo(availableAt + 1n);
+
+      await expect(
+        escrow.connect(other).splitAfterArbiterTimeout(agreementId, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotParty");
+
+      const employeeShare = oddAmounts[0] / 2n;
+      const employerShare = oddAmounts[0] - employeeShare;
+      expect(employerShare).to.equal(employeeShare + 1n);
+
+      const employeeBefore = await ethers.provider.getBalance(employee.address);
+      const employerBefore = await ethers.provider.getBalance(employer.address);
+
+      const splitTx = await escrow
+        .connect(employer)
+        .splitAfterArbiterTimeout(agreementId, 0n);
+      const splitReceipt = await splitTx.wait();
+      const gasPaid = splitReceipt!.gasUsed * splitReceipt!.gasPrice;
+
+      await expect(splitTx)
+        .to.emit(escrow, "Resolved")
+        .withArgs(agreementId, 0n, employeeShare, employerShare);
+
+      // Employee did not send the tx, so their balance changes by the payout alone.
+      expect(await ethers.provider.getBalance(employee.address)).to.equal(
+        employeeBefore + employeeShare,
+      );
+      // Employer paid gas to call split, so subtract gas from the expected total.
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerBefore + employerShare - gasPaid,
+      );
+      expect((await escrow.getMilestone(agreementId, 0n)).status).to.equal(
+        Resolved,
+      );
+
+      await expect(
+        escrow.connect(employee).splitAfterArbiterTimeout(agreementId, 0n),
+      )
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Resolved, Disputed);
+
+      await rejectUntilDisputed(escrow, employee, proofHash, maxRejections);
+      const disputedAt0 = await escrow.disputedAt(0n, 0n);
+      await networkHelpers.time.increaseTo(
+        disputedAt0 + BigInt(ARBITER_TIMEOUT) + 1n,
+      );
+
+      const employeeShare0 = amounts[0] / 2n;
+      const employerShare0 = amounts[0] - employeeShare0;
+      await expect(
+        escrow.connect(employee).splitAfterArbiterTimeout(0n, 0n),
+      )
+        .to.emit(escrow, "Resolved")
+        .withArgs(0n, 0n, employeeShare0, employerShare0);
+
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total - amounts[0]);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        (await unpaidMilestoneSum(escrow, 0n)) +
+          (await unpaidMilestoneSum(escrow, agreementId)),
+      );
+    });
+
+    it("after resolve, approve, submitWork and claimAfterTimeout all revert", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        arbiter,
+        amounts,
+        proofHash,
+        maxRejections,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await rejectUntilDisputed(escrow, employee, proofHash, maxRejections);
+      await escrow.connect(arbiter).resolve(0n, 0n, amounts[0] / 2n);
+
+      await expect(escrow.connect(employer).approve(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Resolved, Submitted);
+
+      await expect(
+        escrow.connect(employee).submitWork(0n, 0n, ethers.id("ipfs://again")),
+      )
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Resolved, Funded);
+
+      await expect(escrow.claimAfterTimeout(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Resolved, Submitted);
+
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        await unpaidMilestoneSum(escrow, 0n),
+      );
     });
   });
 });
