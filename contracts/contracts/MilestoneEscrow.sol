@@ -7,7 +7,7 @@ pragma solidity ^0.8.34;
 ///         approve, reject (with a resubmit window), or let a timeout pay the
 ///         employee. The arbiter (or a 50/50 timeout fallback) settles disputes.
 contract MilestoneEscrow {
-    // This chunk uses Funded through Resolved.
+    // This chunk uses Funded through Cancelled.
     enum MilestoneStatus {
         Funded,
         Submitted,
@@ -100,6 +100,18 @@ contract MilestoneEscrow {
         uint256 employeeAmount,
         uint256 employerAmount
     );
+    event Expired(
+        uint256 indexed agreementId,
+        uint256 indexed milestoneId,
+        address indexed employer,
+        uint256 amount
+    );
+    event MilestoneCancelled(
+        uint256 indexed agreementId,
+        uint256 indexed milestoneId,
+        address indexed employer,
+        uint256 amount
+    );
 
     error IncorrectDeposit(uint256 sent, uint256 required);
     error EmptyMilestones();
@@ -128,6 +140,8 @@ contract MilestoneEscrow {
     error AmountTooHigh(uint256 employeeAmount, uint256 milestoneAmount);
     error TimeoutNotReached(uint256 availableAt);
     error NotParty();
+    error NotExpired(uint256 workDeadline);
+    error NotCancellable(MilestoneStatus current);
 
     /// @notice Employer starts a job and sends the full milestone budget in MON.
     /// @dev msg.sender becomes the employer. ETH (MON on Monad) stays in this contract.
@@ -445,6 +459,73 @@ contract MilestoneEscrow {
         emit AutoReleased(agreementId, milestoneId, employee, amount);
 
         (bool ok, ) = employee.call{value: amount}("");
+        if (!ok) {
+            revert TransferFailed();
+        }
+    }
+
+    /// @notice Employer reclaim when the employee never submitted (or never
+    ///         resubmitted) before the work deadline.
+    function reclaimExpired(
+        uint256 agreementId,
+        uint256 milestoneId
+    ) external nonReentrant {
+        Agreement storage agreement = _requireAgreement(agreementId);
+        if (agreement.cancelled) {
+            revert AgreementCancelled(agreementId);
+        }
+        if (msg.sender != agreement.employer) {
+            revert NotEmployer();
+        }
+
+        Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
+        if (
+            milestone.status != MilestoneStatus.Funded &&
+            milestone.status != MilestoneStatus.Rejected
+        ) {
+            revert WrongStatus(milestone.status, MilestoneStatus.Funded);
+        }
+        if (block.timestamp <= milestone.workDeadline) {
+            revert NotExpired(milestone.workDeadline);
+        }
+
+        uint256 amount = milestone.amount;
+        address employer = agreement.employer;
+        milestone.status = MilestoneStatus.Expired;
+
+        emit Expired(agreementId, milestoneId, employer, amount);
+
+        (bool ok, ) = employer.call{value: amount}("");
+        if (!ok) {
+            revert TransferFailed();
+        }
+    }
+
+    /// @notice Employer cancels a milestone that has not started yet (still Funded).
+    function cancelMilestone(
+        uint256 agreementId,
+        uint256 milestoneId
+    ) external nonReentrant {
+        Agreement storage agreement = _requireAgreement(agreementId);
+        if (agreement.cancelled) {
+            revert AgreementCancelled(agreementId);
+        }
+        if (msg.sender != agreement.employer) {
+            revert NotEmployer();
+        }
+
+        Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
+        if (milestone.status != MilestoneStatus.Funded) {
+            revert NotCancellable(milestone.status);
+        }
+
+        uint256 amount = milestone.amount;
+        address employer = agreement.employer;
+        milestone.status = MilestoneStatus.Cancelled;
+
+        emit MilestoneCancelled(agreementId, milestoneId, employer, amount);
+
+        (bool ok, ) = employer.call{value: amount}("");
         if (!ok) {
             revert TransferFailed();
         }

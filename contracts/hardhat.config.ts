@@ -28,11 +28,39 @@ export default defineConfig({
       type: "edr-simulated",
       chainType: "op",
     },
-    sepolia: {
+    monadTestnet: {
       type: "http",
       chainType: "l1",
-      url: configVariable("SEPOLIA_RPC_URL"),
-      accounts: [configVariable("SEPOLIA_PRIVATE_KEY")],
+      url: "https://testnet-rpc.monad.xyz",
+      chainId: 10143,
+      accounts: [configVariable("MONAD_PRIVATE_KEY")],
+    },
+  },
+  // Monad Hardhat 3 verification: Sourcify (MonadVision) + Etherscan v2 (Monadscan).
+  // See https://docs.monad.xyz/guides/verify-smart-contract/hardhat
+  verify: {
+    blockscout: {
+      enabled: false,
+    },
+    etherscan: {
+      enabled: true,
+      apiKey: configVariable("ETHERSCAN_API_KEY"),
+    },
+    sourcify: {
+      enabled: true,
+      apiUrl: "https://sourcify-api-monad.blockvision.org",
+    },
+  },
+  chainDescriptors: {
+    10143: {
+      name: "MonadTestnet",
+      blockExplorers: {
+        etherscan: {
+          name: "Monadscan",
+          url: "https://testnet.monadscan.com",
+          apiUrl: "https://api.etherscan.io/v2/api",
+        },
+      },
     },
   },
 });

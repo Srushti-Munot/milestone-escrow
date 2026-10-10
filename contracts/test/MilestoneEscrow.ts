@@ -419,6 +419,8 @@ describe("MilestoneEscrow", function () {
   const Approved = 4;
   const AutoReleased = 5;
   const Resolved = 6;
+  const Expired = 7;
+  const Cancelled = 8;
   const ARBITER_TIMEOUT = 3 * 24 * 60 * 60;
 
   async function unpaidMilestoneSum(
@@ -433,7 +435,9 @@ describe("MilestoneEscrow", function () {
       if (
         status !== Approved &&
         status !== AutoReleased &&
-        status !== Resolved
+        status !== Resolved &&
+        status !== Expired &&
+        status !== Cancelled
       ) {
         sum += milestone.amount;
       }
@@ -1256,6 +1260,222 @@ describe("MilestoneEscrow", function () {
 
       expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
         await unpaidMilestoneSum(escrow, 0n),
+      );
+    });
+  });
+
+  describe("reclaimExpired and cancelMilestone", function () {
+    it("reclaimExpired before the deadline reverts, and after it refunds once", async function () {
+      const { escrow, employer, amounts, total, deadlines } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await expect(escrow.reclaimExpired(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "NotExpired")
+        .withArgs(deadlines[0]);
+
+      await networkHelpers.time.increaseTo(deadlines[0] + 1n);
+
+      const employerBefore = await ethers.provider.getBalance(employer.address);
+      const reclaimTx = await escrow.reclaimExpired(0n, 0n);
+      const reclaimReceipt = await reclaimTx.wait();
+      const gasPaid = reclaimReceipt!.gasUsed * reclaimReceipt!.gasPrice;
+
+      await expect(reclaimTx)
+        .to.emit(escrow, "Expired")
+        .withArgs(0n, 0n, employer.address, amounts[0]);
+
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerBefore + amounts[0] - gasPaid,
+      );
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Expired);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        total - amounts[0],
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total - amounts[0]);
+
+      await expect(escrow.reclaimExpired(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Expired, Funded);
+    });
+
+    it("allows only the employer to reclaim or cancel", async function () {
+      const { escrow, employee, arbiter, other, deadlines } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await networkHelpers.time.increaseTo(deadlines[0] + 1n);
+
+      await expect(
+        escrow.connect(employee).reclaimExpired(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+      await expect(
+        escrow.connect(arbiter).reclaimExpired(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+      await expect(
+        escrow.connect(other).reclaimExpired(0n, 0n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+
+      // Milestone 1 is still Funded — cancel access control only.
+      await expect(
+        escrow.connect(employee).cancelMilestone(0n, 1n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+      await expect(
+        escrow.connect(arbiter).cancelMilestone(0n, 1n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+      await expect(
+        escrow.connect(other).cancelMilestone(0n, 1n),
+      ).to.be.revertedWithCustomError(escrow, "NotEmployer");
+    });
+
+    it("reclaimExpired on a Submitted milestone reverts", async function () {
+      const { escrow, employee, proofHash, deadlines } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+      await networkHelpers.time.increaseTo(deadlines[0] + 1n);
+
+      await expect(escrow.reclaimExpired(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Submitted, Funded);
+    });
+
+    it("cancelMilestone on a Funded milestone refunds exactly the amount", async function () {
+      const { escrow, employer, amounts, total } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      const employerBefore = await ethers.provider.getBalance(employer.address);
+      const cancelTx = await escrow.cancelMilestone(0n, 0n);
+      const cancelReceipt = await cancelTx.wait();
+      const gasPaid = cancelReceipt!.gasUsed * cancelReceipt!.gasPrice;
+
+      await expect(cancelTx)
+        .to.emit(escrow, "MilestoneCancelled")
+        .withArgs(0n, 0n, employer.address, amounts[0]);
+
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerBefore + amounts[0] - gasPaid,
+      );
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Cancelled);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        total - amounts[0],
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total - amounts[0]);
+    });
+
+    it("cancelMilestone on Submitted, Rejected, Disputed or Approved reverts", async function () {
+      const { escrow, employer, employee, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+      await expect(escrow.cancelMilestone(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "NotCancellable")
+        .withArgs(Submitted);
+
+      await escrow.reject(0n, 0n, ethers.id("needs-revision"));
+      await expect(escrow.cancelMilestone(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "NotCancellable")
+        .withArgs(Rejected);
+
+      await escrow
+        .connect(employee)
+        .submitWork(0n, 0n, ethers.id("ipfs://v2"));
+      await escrow.reject(0n, 0n, ethers.id("second-reject"));
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Disputed);
+      await expect(escrow.cancelMilestone(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "NotCancellable")
+        .withArgs(Disputed);
+
+      await escrow
+        .connect(employee)
+        .submitWork(0n, 1n, ethers.id("ipfs://frontend"));
+      await escrow.connect(employer).approve(0n, 1n);
+      expect((await escrow.getMilestone(0n, 1n)).status).to.equal(Approved);
+      await expect(escrow.cancelMilestone(0n, 1n))
+        .to.be.revertedWithCustomError(escrow, "NotCancellable")
+        .withArgs(Approved);
+    });
+
+    it("after Expired or Cancelled, submitWork, approve and claimAfterTimeout revert", async function () {
+      const {
+        escrow,
+        employer,
+        employee,
+        amounts,
+        total,
+        proofHash,
+        deadlines,
+      } = await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await networkHelpers.time.increaseTo(deadlines[0] + 1n);
+      await escrow.reclaimExpired(0n, 0n);
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Expired);
+
+      await expect(
+        escrow.connect(employee).submitWork(0n, 0n, proofHash),
+      )
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Expired, Funded);
+      await expect(escrow.connect(employer).approve(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Expired, Submitted);
+      await expect(escrow.claimAfterTimeout(0n, 0n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Expired, Submitted);
+
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        await unpaidMilestoneSum(escrow, 0n),
+      );
+
+      await escrow.cancelMilestone(0n, 1n);
+      expect((await escrow.getMilestone(0n, 1n)).status).to.equal(Cancelled);
+
+      await expect(
+        escrow
+          .connect(employee)
+          .submitWork(0n, 1n, ethers.id("ipfs://frontend")),
+      )
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Cancelled, Funded);
+      await expect(escrow.connect(employer).approve(0n, 1n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Cancelled, Submitted);
+      await expect(escrow.claimAfterTimeout(0n, 1n))
+        .to.be.revertedWithCustomError(escrow, "WrongStatus")
+        .withArgs(Cancelled, Submitted);
+
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        0n,
+      );
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(0n);
+      expect(amounts[0] + amounts[1]).to.equal(total);
+    });
+
+    it("reclaimExpired after a rejection past the resubmit deadline refunds the employer", async function () {
+      const { escrow, employer, employee, amounts, total, proofHash } =
+        await networkHelpers.loadFixture(fundedAgreementFixture);
+
+      await escrow.connect(employee).submitWork(0n, 0n, proofHash);
+      await escrow.reject(0n, 0n, ethers.id("needs-revision"));
+      const rejected = await escrow.getMilestone(0n, 0n);
+      expect(rejected.status).to.equal(Rejected);
+
+      await networkHelpers.time.increaseTo(rejected.workDeadline + 1n);
+
+      const employerBefore = await ethers.provider.getBalance(employer.address);
+      const reclaimTx = await escrow.reclaimExpired(0n, 0n);
+      const reclaimReceipt = await reclaimTx.wait();
+      const gasPaid = reclaimReceipt!.gasUsed * reclaimReceipt!.gasPrice;
+
+      await expect(reclaimTx)
+        .to.emit(escrow, "Expired")
+        .withArgs(0n, 0n, employer.address, amounts[0]);
+
+      expect(await ethers.provider.getBalance(employer.address)).to.equal(
+        employerBefore + amounts[0] - gasPaid,
+      );
+      expect((await escrow.getMilestone(0n, 0n)).status).to.equal(Expired);
+      expect(await unpaidMilestoneSum(escrow, 0n)).to.equal(total - amounts[0]);
+      expect(await ethers.provider.getBalance(await escrow.getAddress())).to.equal(
+        total - amounts[0],
       );
     });
   });
