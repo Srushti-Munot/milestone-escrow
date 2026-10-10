@@ -4,9 +4,10 @@ pragma solidity ^0.8.34;
 /// @title MilestoneEscrow
 /// @notice Holds MON for freelance jobs split into milestones. The employer
 ///         funds on create; the employee submits proof; the employer can
-///         approve and pay that milestone. Reject / timeout / dispute come later.
+///         approve, reject (with a resubmit window), or let a timeout pay the
+///         employee. Arbiter dispute handling comes later.
 contract MilestoneEscrow {
-    // How far a milestone has gone. This chunk uses Funded, Submitted, Approved.
+    // This chunk uses Funded, Submitted, Rejected, Disputed, Approved, AutoReleased.
     enum MilestoneStatus {
         Funded,
         Submitted,
@@ -45,7 +46,7 @@ contract MilestoneEscrow {
     uint256 public constant MAX_MILESTONES = 10;
 
     uint256 public agreementCount;
-    // Simple lock so approve cannot be called again in the same transaction.
+    // Simple lock so payout functions cannot be nested in the same transaction.
     bool private _locked;
 
     mapping(uint256 => Agreement) private _agreements;
@@ -71,6 +72,19 @@ contract MilestoneEscrow {
         address indexed employee,
         uint256 amount
     );
+    event Rejected(
+        uint256 indexed agreementId,
+        uint256 indexed milestoneId,
+        bytes32 reasonHash,
+        uint8 rejectionCount,
+        bool escalatedToDispute
+    );
+    event AutoReleased(
+        uint256 indexed agreementId,
+        uint256 indexed milestoneId,
+        address indexed employee,
+        uint256 amount
+    );
 
     error IncorrectDeposit(uint256 sent, uint256 required);
     error EmptyMilestones();
@@ -90,6 +104,9 @@ contract MilestoneEscrow {
     error WrongStatus(MilestoneStatus current, MilestoneStatus required);
     error DeadlinePassed(uint256 deadline);
     error EmptyProof();
+    error EmptyReason();
+    error ReviewWindowClosed(uint256 closesAt);
+    error ReviewWindowStillOpen(uint256 closesAt);
     error TransferFailed();
     error Reentrant();
 
@@ -143,6 +160,7 @@ contract MilestoneEscrow {
     }
 
     /// @notice Freelancer records a proof hash before the work deadline.
+    ///         First submit is from Funded; a later submit is from Rejected.
     function submitWork(
         uint256 agreementId,
         uint256 milestoneId,
@@ -160,7 +178,10 @@ contract MilestoneEscrow {
         }
 
         Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
-        if (milestone.status != MilestoneStatus.Funded) {
+        if (
+            milestone.status != MilestoneStatus.Funded &&
+            milestone.status != MilestoneStatus.Rejected
+        ) {
             revert WrongStatus(milestone.status, MilestoneStatus.Funded);
         }
         if (block.timestamp > milestone.workDeadline) {
@@ -198,6 +219,88 @@ contract MilestoneEscrow {
         milestone.status = MilestoneStatus.Approved;
 
         emit Approved(agreementId, milestoneId, employee, amount);
+
+        (bool ok, ) = employee.call{value: amount}("");
+        if (!ok) {
+            revert TransferFailed();
+        }
+    }
+
+    /// @notice Employer turns work back. After maxRejections the milestone
+    ///         waits for the arbiter. Otherwise the freelancer gets one more
+    ///         review window to resubmit.
+    function reject(
+        uint256 agreementId,
+        uint256 milestoneId,
+        bytes32 reasonHash
+    ) external {
+        Agreement storage agreement = _requireAgreement(agreementId);
+        if (agreement.cancelled) {
+            revert AgreementCancelled(agreementId);
+        }
+        if (msg.sender != agreement.employer) {
+            revert NotEmployer();
+        }
+        if (reasonHash == bytes32(0)) {
+            revert EmptyReason();
+        }
+
+        Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
+        if (milestone.status != MilestoneStatus.Submitted) {
+            revert WrongStatus(milestone.status, MilestoneStatus.Submitted);
+        }
+
+        uint256 windowEnd = milestone.submittedAt + agreement.reviewWindow;
+        if (block.timestamp > windowEnd) {
+            revert ReviewWindowClosed(windowEnd);
+        }
+
+        uint8 newCount = milestone.rejectionCount + 1;
+        milestone.rejectionCount = newCount;
+
+        bool escalated = newCount >= agreement.maxRejections;
+        if (escalated) {
+            milestone.status = MilestoneStatus.Disputed;
+        } else {
+            milestone.status = MilestoneStatus.Rejected;
+            milestone.workDeadline = block.timestamp + agreement.reviewWindow;
+        }
+
+        emit Rejected(
+            agreementId,
+            milestoneId,
+            reasonHash,
+            newCount,
+            escalated
+        );
+    }
+
+    /// @notice If the employer neither approves nor rejects in time, anyone
+    ///         can release this milestone to the employee.
+    function claimAfterTimeout(
+        uint256 agreementId,
+        uint256 milestoneId
+    ) external nonReentrant {
+        Agreement storage agreement = _requireAgreement(agreementId);
+        if (agreement.cancelled) {
+            revert AgreementCancelled(agreementId);
+        }
+
+        Milestone storage milestone = _requireMilestone(agreementId, milestoneId);
+        if (milestone.status != MilestoneStatus.Submitted) {
+            revert WrongStatus(milestone.status, MilestoneStatus.Submitted);
+        }
+
+        uint256 windowEnd = milestone.submittedAt + agreement.reviewWindow;
+        if (block.timestamp <= windowEnd) {
+            revert ReviewWindowStillOpen(windowEnd);
+        }
+
+        uint256 amount = milestone.amount;
+        address employee = agreement.employee;
+        milestone.status = MilestoneStatus.AutoReleased;
+
+        emit AutoReleased(agreementId, milestoneId, employee, amount);
 
         (bool ok, ) = employee.call{value: amount}("");
         if (!ok) {
